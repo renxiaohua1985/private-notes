@@ -37,4 +37,4 @@ jobs:
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
-          command: d1 migrations apply DB --remote --yes
+          command: d1 migrations apply DB --remote
