@@ -34,7 +34,7 @@
 		{
 			"binding": "DB",
 			"database_name": "private-notes-db",
-			"database_id": "4094639a-affc-44d2-8808-4345d29be8a1",
+			"database_id": "8799e550-928c-4f4a-bed4-7e0e4320c637",
 			"migrations_dir": "migrations",
 			"migrations_table": "d1_migrations"
 		}
