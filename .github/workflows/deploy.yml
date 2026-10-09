@@ -1,0 +1,40 @@
+name: Deploy Private Notes to Cloudflare
+
+on:
+  push:
+    branches:
+      - main  # 当 main 分支有代码推送时触发部署
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22 # 项目要求的 Node 版本
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Code Check
+        run: npm run check # 执行原作者内置的类型与安全检查
+
+      - name: Build and Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          # 传入独立的安全密钥变量
+          secrets: |
+            APP_PASSWORD
+        env:
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+
+      - name: Apply D1 Database Migrations
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          command: d1 migrations apply DB --remote --yes
