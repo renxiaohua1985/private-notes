@@ -467,7 +467,7 @@ describe('private-notes worker', () => {
 		expect(setCookie).toMatch(/(?:^|;\s*)Secure(?:;|$)/i);
 		expect(setCookie).toMatch(/(?:^|;\s*)SameSite=Strict(?:;|$)/i);
 		expect(setCookie).toMatch(/(?:^|;\s*)Path=\/(?:;|$)/i);
-		expect(setCookie).toMatch(/(?:^|;\s*)Max-Age=31536000(?:;|$)/i);
+		expect(setCookie).toMatch(/(?:^|;\s*)Max-Age=604800(?:;|$)/i);
 		expect(setCookie).not.toMatch(/(?:^|;\s*)Domain=/i);
 		expect(response.headers.get('x-request-id')).toBeTruthy();
 
@@ -494,7 +494,7 @@ describe('private-notes worker', () => {
 		expect(renewedSetCookie).toMatch(/(?:^|;\s*)Secure(?:;|$)/i);
 		expect(renewedSetCookie).toMatch(/(?:^|;\s*)SameSite=Strict(?:;|$)/i);
 		expect(renewedSetCookie).toMatch(/(?:^|;\s*)Path=\/(?:;|$)/i);
-		expect(renewedSetCookie).toMatch(/(?:^|;\s*)Max-Age=31536000(?:;|$)/i);
+		expect(renewedSetCookie).toMatch(/(?:^|;\s*)Max-Age=604800(?:;|$)/i);
 		expect(renewedSetCookie).not.toMatch(/(?:^|;\s*)Domain=/i);
 	const renewedCookie = cookieFrom(renewed);
 		expect(renewedCookie).not.toBe(cookie);
@@ -508,7 +508,35 @@ describe('private-notes worker', () => {
 		expect(activeSetCookie).toMatch(/(?:^|;\s*)Secure(?:;|$)/i);
 		expect(activeSetCookie).toMatch(/(?:^|;\s*)SameSite=Strict(?:;|$)/i);
 		expect(activeSetCookie).toMatch(/(?:^|;\s*)Path=\/(?:;|$)/i);
-		expect(activeSetCookie).toMatch(/(?:^|;\s*)Max-Age=31536000(?:;|$)/i);
+		expect(activeSetCookie).toMatch(/(?:^|;\s*)Max-Age=604800(?:;|$)/i);
+	});
+
+	it('looks up the managed signing key once per request and renews error responses', async () => {
+		const statements: string[] = [];
+		const database = new Proxy(env.DB, {
+			get(target, property) {
+				if (property === 'prepare') return (sql: string) => {
+					statements.push(sql);
+					return target.prepare(sql);
+				};
+				const value = Reflect.get(target, property, target);
+				return typeof value === 'function' ? value.bind(target) : value;
+			},
+		});
+		const managedEnv = { ...env, DB: database, COOKIE_SECRET: '' } as Parameters<typeof worker.fetch>[1];
+		const signedIn = await worker.fetch(new Request(`${ORIGIN}/api/login`, {
+			method: 'POST', headers: { 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.88' },
+			body: JSON.stringify({ password: DEFAULT_PASSWORD }),
+		}), managedEnv);
+		expect(signedIn.status).toBe(200);
+		const cookie = cookieFrom(signedIn);
+		for (const path of ['/api/notes', '/api/notes/not-a-uuid']) {
+			statements.length = 0;
+			const response = await worker.fetch(new Request(`${ORIGIN}${path}`, { headers: { cookie } }), managedEnv);
+			expect(response.status).toBe(path.endsWith('not-a-uuid') ? 400 : 200);
+			expect(response.headers.get('set-cookie')).toMatch(/^__Host-session=/);
+			expect(statements.filter(sql => sql.startsWith('SELECT value FROM app_meta WHERE key = ?'))).toHaveLength(1);
+		}
 	});
 
 	it('rejects malformed login requests and incorrect passwords', async () => {
@@ -686,6 +714,29 @@ describe('private-notes worker', () => {
 			headers: { cookie, 'if-match': String(updatedRevision) },
 		});
 		expect(deleted.status).toBe(200);
+	});
+
+	it('replays identical note creation without duplicating or crossing vaults', async () => {
+		const { cookie } = await login();
+		const { cookie: guestCookie } = await login(GUEST_PASSWORD);
+		const id = crypto.randomUUID();
+		const body = JSON.stringify({ id, title: encryptedValue('retry-title'), content: encryptedValue('retry-content') });
+		const create = (sessionCookie: string, requestBody = body) => api('/api/notes', {
+			method: 'POST', headers: { cookie: sessionCookie, 'content-type': 'application/json' }, body: requestBody,
+		});
+		const first = await create(cookie);
+		expect(first.status).toBe(201);
+		const firstBody = await jsonBody(first);
+		const replay = await create(cookie);
+		expect(replay.status).toBe(200);
+		expect((await jsonBody(replay)).note).toEqual(firstBody.note);
+		const conflict = await create(cookie, JSON.stringify({ ...JSON.parse(body), content: encryptedValue('changed') }));
+		expect(conflict.status).toBe(409);
+		expect((await create(guestCookie)).status).toBe(409);
+		const stored = await api(`/api/notes/${id}`, { headers: { cookie } });
+		expect((await jsonBody(stored)).note).toEqual(firstBody.note);
+		const count = await env.DB.prepare('SELECT COUNT(*) AS count FROM notes WHERE id = ?').bind(id).first<{ count: number }>();
+		expect(count?.count).toBe(1);
 	});
 
 	it('enforces ciphertext field and request body size limits', async () => {
@@ -1033,17 +1084,20 @@ describe('cookie-independent device sessions', () => {
     const { response } = await login();
     const issued = await jsonBody(response);
     expect(issued.token).toBeTruthy();
-    expect(Number(issued.expiresAt)).toBeGreaterThan(Date.now() + 364 * 86400000);
+    expect(Number(issued.expiresAt)).toBeGreaterThan(Date.now() + 6 * 86400000);
     const headers = { authorization: 'Bearer ' + issued.token };
     const restored = await api('/api/session', { headers });
     const renewed = await jsonBody(restored);
     expect(renewed).toMatchObject({ authenticated: true, vaultId: 'default' });
     expect(renewed.token).toBeTruthy();
     expect(Number(renewed.expiresAt)).toBeGreaterThanOrEqual(Number(issued.expiresAt));
+    expect(restored.headers.get('x-session-token')).toBe(renewed.token);
     expect(restored.headers.get('cache-control')).toBe('no-store');
-    const notes = await api('/api/notes', { headers });
+    const renewedHeaders = { authorization: 'Bearer ' + renewed.token };
+    const notes = await api('/api/notes', { headers: renewedHeaders });
     expect(notes.status).toBe(200);
     expect((await jsonBody(notes)).notes).toEqual([]);
+    expect(notes.headers.get('x-session-token')).toBeTruthy();
   });
 
   it('an explicit invalid token cannot fall back to a valid cookie', async () => {
